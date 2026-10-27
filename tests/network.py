@@ -11,6 +11,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from configuration import firewall
+from isolation import check_firewall
 
 
 def run(*args):
@@ -39,7 +40,7 @@ def main():
     run('ip', 'link', 'set', 'lo', 'up')
     Path('/proc/sys/net/ipv4/ip_forward').write_text('1')
     processes = []
-    namespaces = ['nc-test-app', 'nc-test-db', 'nc-test-redis', 'nc-test-wan']
+    namespaces = ['nc-test-app', 'nc-test-db', 'nc-test-redis', 'nc-test-wan', 'nc-test-foreign']
     for name in namespaces:
         run('ip', 'netns', 'add', name)
         run('ip', '-n', name, 'link', 'set', 'lo', 'up')
@@ -59,11 +60,14 @@ def main():
     endpoint('nc-test-app', 'app-back', 'eth1', '172.30.91.2/28', 'br-nc-back')
     endpoint('nc-test-db', 'db-back', 'eth0', '172.30.91.3/28', 'br-nc-back')
     endpoint('nc-test-redis', 'redis-back', 'eth0', '172.30.91.4/28', 'br-nc-back')
+    endpoint('nc-test-foreign', 'foreign-front', 'eth0', '172.30.90.3/28', 'br-nc-front')
     endpoint('nc-test-wan', 'net0', 'eth0', '8.8.4.2/24')
     run('ip', 'address', 'add', '8.8.4.1/24', 'dev', 'net0')
     run('ip', 'route', 'add', 'default', 'via', '8.8.4.2')
     run('ip', '-n', 'nc-test-app', 'route', 'add', 'default', 'via', '172.30.90.1')
     run('ip', '-n', 'nc-test-wan', 'route', 'add', 'default', 'via', '8.8.4.1')
+    run('ip', '-n', 'nc-test-foreign', 'route', 'add', 'default', 'via', '172.30.90.1')
+    run('ip', '-n', 'nc-test-db', 'route', 'add', 'default', 'via', '172.30.91.1')
     for ip in ['1.1.1.1/32', '169.254.169.254/32', '10.15.0.2/32']:
         run('ip', '-n', 'nc-test-wan', 'address', 'add', ip, 'dev', 'lo')
     serve = '''import socket,select,sys
@@ -107,11 +111,13 @@ except OSError: sys.exit(1)
     try:
         server(None, 22, 443)
         server('nc-test-app', 8080)
+        server('nc-test-foreign', 8080)
         server('nc-test-db', 5432, 8080)
         server('nc-test-redis', 6379, 8080)
         server('nc-test-wan', 53, 80, 443, 853)
         # До firewall проверяем, что отрицательные проверки действительно имеют listener.
         check('nc-test-app', '172.30.91.3', 8080, True, 'listener до фильтрации')
+        check('nc-test-foreign', '172.30.90.2', 8080, True, 'посторонний контейнер до фильтрации')
         with tempfile.TemporaryDirectory() as tmp:
             config = args.firewall or Path(tmp) / 'nextcloud.nft'
             if not args.firewall:
@@ -138,6 +144,23 @@ except OSError: sys.exit(1)
         check('nc-test-app', '10.15.0.2', 443, False, 'доступ в приватную сеть запрещён')
         check('nc-test-wan', '172.30.90.2', 8080, False, 'WAN → Nextcloud напрямую запрещено')
         check('nc-test-wan', '172.30.91.3', 5432, False, 'WAN → PostgreSQL запрещено')
+        check('nc-test-wan', '172.30.91.4', 6379, False, 'WAN → Redis запрещено')
+        check('nc-test-foreign', '172.30.90.2', 8080, False, 'посторонний контейнер → приложение запрещено')
+        check('nc-test-app', '172.30.90.3', 8080, False, 'приложение → сосед front запрещено')
+        check('nc-test-foreign', '172.30.91.3', 5432, False, 'посторонний контейнер → БД запрещено')
+        check('nc-test-db', '172.30.91.2', 8080, False, 'БД → приложение запрещено')
+        check('nc-test-db', '1.1.1.1', 443, False, 'БД → Интернет запрещено')
+        check('nc-test-redis', '172.30.91.3', 5432, False, 'Redis → БД запрещено')
+        check(None, '172.30.91.4', 6379, False, 'хост → Redis запрещено')
+        check_firewall(firewall(json.loads((ROOT / 'site.example.json').read_text())))
+        print('PASS проверка фактического firewall', flush=True)
+        run('nft', 'insert', 'rule', 'inet', 'nextcloud', 'forward', 'counter', 'accept')
+        try:
+            check_firewall(firewall(json.loads((ROOT / 'site.example.json').read_text())))
+        except ValueError:
+            print('PASS подмена firewall обнаружена', flush=True)
+        else:
+            raise AssertionError('Подмена firewall не обнаружена')
     finally:
         for p in processes:
             p.terminate()

@@ -9,7 +9,7 @@ def validate(c):
     required = {'domain', 'admin_user', 'wan_interface', 'frontend_subnet',
                 'backend_subnet', 'dns', 'certificate', 'certificate_key',
                 'default_phone_region', 'maintenance_window_start'}
-    if set(c) != required:
+    if not isinstance(c, dict) or set(c) != required:
         raise ValueError('Неверный набор полей site.json; сверьтесь с site.example.json')
     if not isinstance(c['domain'], str) or not re.fullmatch(
             r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+'
@@ -23,9 +23,11 @@ def validate(c):
     if c['wan_interface'] in {'lo', 'br-nc-front', 'br-nc-back'}:
         raise ValueError('Неверный внешний интерфейс')
     for key in ['certificate', 'certificate_key']:
-        if not re.fullmatch(r'/[a-zA-Z0-9_./-]+', c[key]) or '..' in Path(c[key]).parts:
+        if not isinstance(c[key], str) or not re.fullmatch(r'/[a-zA-Z0-9_./-]+', c[key]) or '..' in Path(c[key]).parts:
             raise ValueError('Небезопасный путь сертификата')
     private = [ipaddress.ip_network(n) for n in ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']]
+    if any(not isinstance(c[k], str) for k in ['frontend_subnet', 'backend_subnet']):
+        raise ValueError('Подсети должны быть строками IPv4 CIDR')
     nets = [ipaddress.ip_network(c[k], strict=True) for k in ['frontend_subnet', 'backend_subnet']]
     if any(n.version != 4 or n.prefixlen != 28 or not any(n.subnet_of(p) for p in private) for n in nets):
         raise ValueError('Сети должны быть непересекающимися частными IPv4 /28')
@@ -34,6 +36,8 @@ def validate(c):
     if not isinstance(c['dns'], list) or not 1 <= len(c['dns']) <= 3:
         raise ValueError('Укажите 1–3 публичных DNS IPv4')
     for value in c['dns']:
+        if not isinstance(value, str):
+            raise ValueError('DNS должен быть строкой IPv4')
         ip = ipaddress.ip_address(value)
         if ip.version != 4 or not ip.is_global or ip.is_multicast:
             raise ValueError('DNS должен быть публичным IPv4')
@@ -60,6 +64,9 @@ $CONFIG = [
     'overwrite.cli.url' => 'https://DOMAIN',
     'overwritecondaddr' => '^GATEWAY_REGEX$',
     'datadirectory' => '/var/lib/nextcloud/data',
+    'config_is_read_only' => getenv('NC_CONFIG_WRITABLE') !== '1',
+    'localstorage.allowsymlinks' => false,
+    'localstorage.umask' => 0077,
     'memcache.local' => '\OC\Memcache\APCu',
     'memcache.distributed' => '\OC\Memcache\Redis',
     'memcache.locking' => '\OC\Memcache\Redis',
@@ -103,6 +110,8 @@ def nginx_config(c):
     a = addresses(c)
     # На relay порт 80 закрыт; сертификат предоставляет администратор (DNS-01).
     return rf'''# nextcloud-stack: отдельный vhost, nginx на хосте.
+limit_conn_zone $realip_remote_addr zone=NextcloudConnections:10m;
+limit_req_zone $realip_remote_addr zone=NextcloudRequests:10m rate=30r/s;
 server {{
     listen 443 ssl;
     # Отдельный адрес для self-check: другие wildcard-vhost сюда не попадают.
@@ -116,8 +125,14 @@ server {{
     ssl_session_cache shared:NextcloudTLS:10m;
     server_tokens off;
     client_max_body_size 1g;
+    client_header_timeout 15s;
     client_body_timeout 300s;
+    keepalive_timeout 30s;
     send_timeout 300s;
+    limit_conn NextcloudConnections 32;
+    limit_conn_status 429;
+    limit_req zone=NextcloudRequests burst=120 nodelay;
+    limit_req_status 429;
     add_header Strict-Transport-Security "max-age=15552000" always;
     # Nextcloud сам выставляет CSP/COOP/X-Frame-Options — не заменять их.
     access_log off;
@@ -242,7 +257,7 @@ def compose(c, state, images, app_image):
            'environment': {'NC_DOMAIN': c['domain'], 'NC_ADMIN_USER': c['admin_user']},
            'extra_hosts': {c['domain']: a['gateway']},
            'secrets': ['db_password', 'redis_password'],
-           'volumes': [mount('config', '/var/lib/nextcloud/config'),
+           'volumes': [mount('config', '/var/lib/nextcloud/config', True),
                        mount('apps', '/var/lib/nextcloud/apps', True),
                        mount('data', '/var/lib/nextcloud/data'),
                        mount('generated/security.config.php', '/var/lib/nextcloud/config/zz-security.config.php', True)],
@@ -251,6 +266,8 @@ def compose(c, state, images, app_image):
            'depends_on': {'db': {'condition': 'service_healthy'}, 'redis': {'condition': 'service_healthy'}}}
     init = {**app, 'profiles': ['tools'], 'entrypoint': ['php'],
             'command': ['/opt/nextcloud/install.php'], 'healthcheck': {'disable': True},
+            'environment': {**app['environment'], 'NC_CONFIG_WRITABLE': '1'},
+            'volumes': [mount('config', '/var/lib/nextcloud/config'), *app['volumes'][1:]],
             'secrets': ['db_password', 'redis_password', 'admin_password']}
     return {'name': 'nextcloud', 'services': {
         'app': app, 'init': init,

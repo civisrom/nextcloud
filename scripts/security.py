@@ -9,16 +9,17 @@ import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
+from isolation import private_directory
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def read_lock(path=ROOT / 'images.lock.json'):
     images = json.loads(path.read_text())
-    if set(images) != {'nextcloud', 'postgres', 'redis'}:
+    if not isinstance(images, dict) or set(images) != {'nextcloud', 'postgres', 'redis'}:
         raise ValueError('Неверный images.lock.json')
     for name, ref in images.items():
-        if not re.fullmatch(r'docker.io/library/' + name + r':[a-zA-Z0-9_.-]+@sha256:[a-f0-9]{64}', ref):
+        if not isinstance(ref, str) or not re.fullmatch(r'docker.io/library/' + name + r':[a-zA-Z0-9_.-]+@sha256:[a-f0-9]{64}', ref):
             raise ValueError('Нужны официальные образы, закреплённые SHA256 digest')
     if not images['nextcloud'].startswith('docker.io/library/nextcloud:35.'):
         raise ValueError('Этот установщик рассчитан на Nextcloud 35; переход major требует проверки совместимости')
@@ -43,8 +44,8 @@ def findings(report, image=False):
         meta = report.get('Metadata', {}).get('OS', {})
         if not meta.get('Family') or meta.get('EOSL'):
             raise ValueError('ОС образа не распознана или больше не поддерживается')
-        if not report.get('Results'):
-            raise ValueError('Образ не был просканирован')
+        if not any(r.get('Class') == 'os-pkgs' and r.get('Packages') for r in report.get('Results', [])):
+            raise ValueError('Отчёт не подтверждает сканирование OS-пакетов образа')
     counts = collections.Counter()
     blocked = []
     for result in report.get('Results', []):
@@ -75,8 +76,7 @@ def upstream(images, audit):
 
 def scan(audit, images, built=None, remote=True):
     audit = Path(audit)
-    audit.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(audit, 0o700)
+    private_directory(audit, create=True, owner=os.geteuid())
     if not shutil.which('trivy'):
         raise ValueError('Установите Trivy: sudo ./tools/install-trivy.sh')
     environment = {k: v for k, v in os.environ.items() if not k.startswith('TRIVY_')}
@@ -84,6 +84,7 @@ def scan(audit, images, built=None, remote=True):
     if not re.fullmatch(r'\d+\.\d+\.\d+', version) or tuple(map(int, version.split('.'))) < (0, 76, 1):
         raise ValueError('Обновите Trivy до версии не ниже 0.76.1')
     cache = audit.parent / 'trivy-cache'
+    private_directory(cache, create=True, owner=os.geteuid())
     base = ['trivy', '--config', '/dev/null', '--cache-dir', str(cache)]
     def invoke(args, name):
         with (audit / (name + '.log')).open('wb') as log:
