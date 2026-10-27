@@ -1,0 +1,12 @@
+{
+  "domain": "cloud.example.com",
+  "admin_user": "ncadmin",
+  "wan_interface": "net0",
+  "frontend_subnet": "172.30.90.0/28",
+  "backend_subnet": "172.30.91.0/28",
+  "dns": ["1.1.1.1", "9.9.9.9"],
+  "certificate": "/etc/letsencrypt/live/cloud.example.com/fullchain.pem",
+  "certificate_key": "/etc/letsencrypt/live/cloud.example.com/privkey.pem",
+  "default_phone_region": "RU",
+  "maintenance_window_start": 1
+}

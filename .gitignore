@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+site.json
+state/
+reports/
+research/
+*.log
+*.tar
+*.tar.gz
+*.age
+*.pem
+*.key
+secrets/
+local/
